@@ -1,14 +1,18 @@
 from math import e
+from re import T
 import os, sys
 import tempfile
 import time, datetime
 import logging
 import argparse, shlex
 import subprocess
+import textwrap
 
-from generate_dailies.tc import Timecode
-import generate_dailies.pyseq as pyseq
+from utils.tc import Timecode
+import utils.pyseq as pyseq
 import json
+from test.connection import *
+
 
 try:
     import oiio
@@ -37,7 +41,7 @@ class GenrateDaily:
         config=None,
         output=None,
         project=None,
-        task=None,
+        task_id=None,
         scope=None,
     ):
         self.start_time = time.time()
@@ -50,7 +54,7 @@ class GenrateDaily:
         self.config = config
         self.output = output
         self.project = project
-        self.task = task
+        self.task_id = task_id
         self.scope = scope
 
         parser = argparse.ArgumentParser(
@@ -104,6 +108,14 @@ class GenrateDaily:
             )
             self.setup_success = False
             return
+
+        self.connection = Connection(username="PFXHO_048", password="Bh@r@th123")
+        self.datalist = self.connection.get_datalist(
+            scope_name=self.scope,
+            proj_code=self.project,
+            task_id=self.task_id,
+        )
+        # print("Data List: {0}".format(self.datalist))
 
         self.slate_profile = config.get("slate_profiles")
 
@@ -306,6 +318,13 @@ class GenrateDaily:
         # Loop through each text element, create the text image, and add it to self.static_text_buf_zero_frame
         zero_frame_text_elements = self.zero_frame.get("static_text_elements")
         if zero_frame_text_elements:
+
+            images = self.zero_frame.get("images")
+            for image_name, image_prop in images.items():
+                self.static_text_buf_zero_frame = self.create_image(
+                    image_prop, self.static_text_buf_zero_frame
+                )
+
             for text_element_name, text_element in zero_frame_text_elements.items():
                 log.info("Generate Text")
                 self.generate_text(
@@ -343,10 +362,6 @@ class GenrateDaily:
 
             if i == 1:
                 buf = self.process_frame(self.frame, zero_frame=True)
-
-                images = self.zero_frame.get("images")
-                for image_name, image_prop in images.items():
-                    buf = self.create_image(image_prop, buf)
 
                 # defaults_text_element = self.zero_frame.get("defaults")
                 # for (
@@ -430,6 +445,7 @@ class GenrateDaily:
                     alpha = pillow_fg_image.split()[3]
                     alpha = ImageEnhance.Brightness(alpha).enhance(opacity)
                     pillow_fg_image.putalpha(alpha)
+
                 pillow_buf_image.alpha_composite(pillow_fg_image, (x_offset, y_offset))
                 composited_image_np = np.array(pillow_buf_image)
                 composited_image_buf = oiio.ImageBuf(composited_image_np)
@@ -491,10 +507,12 @@ class GenrateDaily:
             else:
                 text_contents = str(self.frame.frame).zfill(4)
         else:
-            text_contents = " ".join(
-                [text_element["prefix"].strip(), text_element["value"]]
-            ).strip()
+            if text_element["islabel"]:
+                text_contents = text_element["value"]
+            else:
+                text_contents = self.datalist[f"{text_element_name}"]
 
+        text_contents = textwrap.fill(text_contents, width=40)
         # Convert from Nuke-style (reference = lower left) to OIIO Style (reference = upper left)
         box_ll[1] = int(self.output_height - box_ll[1])
         box_ur[1] = int(self.output_height - box_ur[1])
@@ -971,7 +989,9 @@ class GenrateDaily:
 
 
 def main():
-    daily = GenrateDaily()
+    daily = GenrateDaily(
+        scope="Asset/env/CHAD_LAB_BUNKER_EXTERIOR", project="bn2", task_id=125880
+    )
 
 
 if __name__ == "__main__":

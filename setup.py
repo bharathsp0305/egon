@@ -20,5 +20,5 @@ setup(
     },
     # install_requires=required,
     python_requires=">=3.6",
-    package_data={"generate_dailies": ["configs/*", "fonts/**"]},
+    package_data={"generate_dailies": ["configs/*", "fonts/**", "utils/*"]},
 )
