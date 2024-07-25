@@ -1,5 +1,3 @@
-from math import e
-from re import T
 import os, sys
 import tempfile
 import time, datetime
@@ -10,8 +8,7 @@ import textwrap
 
 from utils.tc import Timecode
 import utils.pyseq as pyseq
-import json
-from test.connection import *
+from utils.connection import *
 
 
 try:
@@ -29,7 +26,6 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_CODEC = "hevc"
 DEFAULT_OCIO_FILE_PATH = os.path.join(dir_path, "configs", "config.ocio")
 DEFAULT_OCIO_TRANSFORM = ["linear", "sRGB"]
-DEBUG = False
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +39,11 @@ class GenrateDaily:
         project=None,
         task_id=None,
         scope=None,
+        **kwargs,
     ):
         self.start_time = time.time()
         self.setup_success = False
+        self.output_codecs_file = None
         self.renamed_file = ""
         self.first_frame_path = ""
         self.framecounter = 0
@@ -56,6 +54,9 @@ class GenrateDaily:
         self.project = project
         self.task_id = task_id
         self.scope = scope
+
+        for key, value in kwargs:
+            setattr(self, key, value)
 
         parser = argparse.ArgumentParser(
             description="Process given image sequence with ocio display, resize and output to ffmpeg for encoding into a dailies movie."
@@ -68,10 +69,6 @@ class GenrateDaily:
 
         parser.add_argument("-s", "--scope", help="Scope Id : Thadam Scope ID.")
 
-        parser.add_argument(
-            "-d", "--debug", help="Set debug to true.", action="store_true"
-        )
-
         # Show help if no args.
         if len(sys.argv) == 1:
             parser.print_help()
@@ -79,59 +76,43 @@ class GenrateDaily:
 
         args = parser.parse_args()
 
+        self.connection = Connection(username="PFXHO_048", password="Bh@r@th123")
+
         # Parse Config File
         if not self.config:
-            self.config = os.getenv("DAILIES_CONFIG")
+            try:
+                self.config = self.connection.get_slate_configuration(
+                    proj_code="bn2", daily_type="INTERNAL"
+                )
+            except Exception as e:
+                log.error(f"Error : {e}")
+                self.setup_success = False
+                return
 
-        if self.config == None:
-            print("Error: No config file specified!")
-            self.setup_success = False
-            return
-
-        # Get Config file data
-        if os.path.isfile(self.config):
-            with open(self.config, "r") as configfile:
-                config = json.load(configfile)
+        if not self.output_codecs_file:
+            self.output_codecs_file = self.connection.get_attribute_codec(getcodec=True)
         else:
-            print("Error: Could not find config file {0}".format(self.config))
+            print("Error: Could not get Codec")
             self.setup_success = False
             return
 
-        if os.path.isfile(os.path.join(dir_path, "configs", "output-codec.json")):
-            with open(
-                os.path.join(dir_path, "configs", "output-codec.json"), "r"
-            ) as codecfile:
-                output_codecs_file = json.load(codecfile)
-        else:
-            print(
-                "Error: Could not find config file {0}".format("./output-codecs.json")
-            )
-            self.setup_success = False
-            return
-
-        self.connection = Connection(username="PFXHO_048", password="Bh@r@th123")
         self.datalist = self.connection.get_datalist(
-            scope_name=self.scope,
-            proj_code=self.project,
-            task_id=self.task_id,
+            scope_name="Asset/env/CHAD_LAB_BUNKER_EXTERIOR",
+            proj_code="bn2",
+            task_id="125880",
         )
-        # print("Data List: {0}".format(self.datalist))
 
-        self.slate_profile = config.get("slate_profiles")
+        self.slate_profile = self.config.get("slate_profiles")
 
-        self.globals_config = config.get("globals")
+        self.globals_config = self.config.get("globals")
         input_path = args.input_path
         codec = self.globals_config.get("output_codec")
         self.movie_location = None
 
-        if args.debug:
-            print("Setting DEBUG=True!")
-            DEBUG = True
-
         if not codec:
             codec = DEFAULT_CODEC
 
-        self.codec_config = output_codecs_file.get("output_codecs").get(codec)
+        self.codec_config = self.output_codecs_file.get(codec)
 
         self.image_sequences = self.get_image_sequences(input_path)
 
@@ -341,11 +322,10 @@ class GenrateDaily:
                     text_element_name, text_element, self.static_text_buf_first_frame
                 )
 
-        if not DEBUG:
             # Invoke ffmpeg subprocess
-            ffproc = subprocess.Popen(
-                shlex.split(ffmpeg_args), stdin=subprocess.PIPE, stdout=subprocess.PIPE
-            )
+        ffproc = subprocess.Popen(
+            shlex.split(ffmpeg_args), stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
 
         # Loop through every frame, passing the result to the ffmpeg subprocess
 
@@ -363,19 +343,12 @@ class GenrateDaily:
             if i == 1:
                 buf = self.process_frame(self.frame, zero_frame=True)
 
-                # defaults_text_element = self.zero_frame.get("defaults")
-                # for (
-                #     text_element_name,
-                #     text_element,
-                # ) in defaults_text_element.items():
-                #     if text_element_name == "frame_and_slate":
-                #         text_element["value"] = (
-                #             f"{self.image_sequence.length()} Frames + 1 Slate"
-                #         )
-                #     self.generate_text(text_element_name, text_element, buf)
-
             else:
                 buf = self.process_frame(self.frame)
+
+                images = self.first_frame.get("images")
+                for image_name, image_prop in images.items():
+                    buf = self.create_image(image_prop, buf)
 
                 first_frame_dynamic_text_elements = self.first_frame.get(
                     "dynamic_text_elements"
@@ -388,31 +361,18 @@ class GenrateDaily:
                         log.info("Generate Text")
                         self.generate_text(text_element_name, text_element, buf)
 
-                images = self.first_frame.get("images")
-                for image_name, image_prop in images.items():
-                    buf = self.create_image(image_prop, buf)
-
-            if not DEBUG:
-                # If MJPEG: convert from raw byte data to jpeg before passing to ffmpeg for concatenation
-                pixels = buf.get_pixels(self.pixel_data_type)
-                if self.codec_config["name"] == "mjpeg":
-                    jpeg_img = Image.fromarray(pixels, mode="RGB")
-                    jpeg_img.save(ffproc.stdin, "JPEG", subsampling="4:4:4", quality=95)
-                else:
-                    ffproc.stdin.write(pixels)
+            pixels = buf.get_pixels(self.pixel_data_type)
+            if self.codec_config["name"] == "mjpeg":
+                jpeg_img = Image.fromarray(pixels, mode="RGB")
+                jpeg_img.save(ffproc.stdin, "JPEG", subsampling="4:4:4", quality=95)
             else:
-                buf.write(
-                    os.path.splitext(self.movie_fullpath)[0]
-                    + ".{0:05d}.jpg".format(self.frame.frame)
-                )
+                ffproc.stdin.write(pixels)
 
             frame_elapsed_time = datetime.timedelta(
                 seconds=time.time() - frame_start_time
             )
             log.info("Frame Processing Time: \t{0}".format(frame_elapsed_time))
 
-        if not DEBUG:
-            result, error = ffproc.communicate()
         elapsed_time = datetime.timedelta(seconds=time.time() - self.start_time)
         log.info("Total Processing Time: \t{0}".format(elapsed_time))
         if self.renamed_file != "":
@@ -979,7 +939,7 @@ class GenrateDaily:
 
         f = os.listdir(input_path)
 
-        dir_path, base_filename = os.path.split(f[1])
+        folder_path, base_filename = os.path.split(f[1])
         base_filename_without_ext, ext = os.path.splitext(base_filename)
         zero_frame_filename = f"{base_filename_without_ext[:-4]}0000{ext}"
         first_frame_filename = f"{base_filename_without_ext[:-4]}0001{ext}"
