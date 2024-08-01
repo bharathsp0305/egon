@@ -1,0 +1,8 @@
+certifi==2024.7.4
+charset-normalizer==3.3.2
+idna==3.7
+numpy==2.0.1
+pillow==10.4.0
+py-oiio @ file:///D:/bharathsp/EGON/egon/py-oiio/dist/py_oiio-0.0.1-py3-none-any.whl#sha256=353a37fabe971b3265ca85964c3aa500ca4e7dcb4a5a073a23d1f57eed6ea3d5
+requests==2.32.3
+urllib3==2.2.2
