@@ -9,3 +9,4 @@ build/
 *.exr
 .vscode
 .venv
+test/

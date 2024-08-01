@@ -1,14 +1,15 @@
-from math import e
 import os, sys
 import tempfile
 import time, datetime
 import logging
 import argparse, shlex
 import subprocess
+import textwrap
 
-from generate_dailies.tc import Timecode
-import generate_dailies.pyseq as pyseq
-import json
+from utils.tc import Timecode
+import utils.pyseq as pyseq
+from utils.connection import *
+
 
 try:
     import oiio
@@ -25,7 +26,6 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_CODEC = "hevc"
 DEFAULT_OCIO_FILE_PATH = os.path.join(dir_path, "configs", "config.ocio")
 DEFAULT_OCIO_TRANSFORM = ["linear", "sRGB"]
-DEBUG = False
 
 log = logging.getLogger(__name__)
 
@@ -37,20 +37,21 @@ class GenrateDaily:
         config=None,
         output=None,
         project=None,
-        task=None,
+        task_id=None,
         scope=None,
+        **kwargs,
     ):
         self.start_time = time.time()
         self.setup_success = False
+        self.output_codecs_file = None
         self.renamed_file = ""
         self.first_frame_path = ""
-        self.framecounter = 0
 
         self.input_path = input_path
         self.config = config
-        self.output = output
+        self.movie_location = output
         self.project = project
-        self.task = task
+        self.task_id = task_id
         self.scope = scope
 
         parser = argparse.ArgumentParser(
@@ -64,9 +65,7 @@ class GenrateDaily:
 
         parser.add_argument("-s", "--scope", help="Scope Id : Thadam Scope ID.")
 
-        parser.add_argument(
-            "-d", "--debug", help="Set debug to true.", action="store_true"
-        )
+        # parser.add_argument("-an", "--artist-notes", help="Scope Id : Thadam Scope ID.")
 
         # Show help if no args.
         if len(sys.argv) == 1:
@@ -75,51 +74,44 @@ class GenrateDaily:
 
         args = parser.parse_args()
 
-        # Parse Config File
+        self.connection = Connection(username="PFXHO_048", password="Bh@r@th123")
+
         if not self.config:
-            self.config = os.getenv("DAILIES_CONFIG")
+            try:
+                self.config = self.connection.get_slate_configuration(
+                    proj_code="bn2", daily_type="INTERNAL"
+                )
+            except Exception as e:
+                log.error(f"Error : {e}")
+                self.setup_success = False
+                return
 
-        if self.config == None:
-            print("Error: No config file specified!")
-            self.setup_success = False
-            return
-
-        # Get Config file data
-        if os.path.isfile(self.config):
-            with open(self.config, "r") as configfile:
-                config = json.load(configfile)
+        if not self.output_codecs_file:
+            self.output_codecs_file = self.connection.get_attribute_codec(getcodec=True)
         else:
-            print("Error: Could not find config file {0}".format(self.config))
+            print("Error: Could not get Codec")
             self.setup_success = False
             return
 
-        if os.path.isfile(os.path.join(dir_path, "configs", "output-codec.json")):
-            with open(
-                os.path.join(dir_path, "configs", "output-codec.json"), "r"
-            ) as codecfile:
-                output_codecs_file = json.load(codecfile)
-        else:
-            print(
-                "Error: Could not find config file {0}".format("./output-codecs.json")
-            )
-            self.setup_success = False
-            return
+        self.datalist = self.connection.get_datalist(
+            scope_name="Asset/env/CHAD_LAB_BUNKER_EXTERIOR",
+            proj_code="bn2",
+            task_id="125880",
+        )
 
-        self.slate_profile = config.get("slate_profiles")
+        for key, value in kwargs.items():
+            self.datalist.update({key: value})
 
-        self.globals_config = config.get("globals")
+        self.slate_profile = self.config.get("slate_profiles")
+
+        self.globals_config = self.config.get("globals")
         input_path = args.input_path
         codec = self.globals_config.get("output_codec")
-        self.movie_location = None
-
-        if args.debug:
-            print("Setting DEBUG=True!")
-            DEBUG = True
 
         if not codec:
             codec = DEFAULT_CODEC
 
-        self.codec_config = output_codecs_file.get("output_codecs").get(codec)
+        self.codec_config = self.output_codecs_file.get(codec)
 
         self.image_sequences = self.get_image_sequences(input_path)
 
@@ -132,7 +124,6 @@ class GenrateDaily:
         print("OCIO Config: {0}".format(self.ocioconfig))
         if self.ocioconfig:
             log.debug("Got OCIO config from config: {0}".format(self.ocioconfig))
-        # Try to get ocio config from $OCIO env-var if it's not defined
         if not self.ocioconfig:
             env_ocio = os.getenv("OCIO")
             if env_ocio:
@@ -148,7 +139,6 @@ class GenrateDaily:
             )
             self.ocioconfig = None
 
-        # Get default ocio transform to use if none is passed by commandline
         self.ociocolorconvert = self.globals_config.get("ocio_transform")
 
         if self.ociocolorconvert:
@@ -156,7 +146,6 @@ class GenrateDaily:
                 "Got OCIO Transform from config: {0}".format(self.ociocolorconvert)
             )
         else:
-            # No ocio color transform specified
             print("Warning: No default ocio transform specified, Using default OCIO.")
             self.ociocolorconvert = DEFAULT_OCIO_TRANSFORM
 
@@ -190,9 +179,6 @@ class GenrateDaily:
             None
         """
 
-        # Set up movie file location and naming
-
-        # Crop separating character from sequence basename if there is one.
         seq_basename = self.image_sequence.head()
 
         if seq_basename.endswith(self.image_sequence.parts[-2]):
@@ -201,15 +187,11 @@ class GenrateDaily:
         movie_ext = self.globals_config["movie_ext"]
         slate_type = self.globals_config["slate_type"]
 
-        # Create full movie filename
-
         current_datetime = datetime.datetime.now()
         datetime_str = current_datetime.strftime("%d_%m_%Y_%H_%M")
         movie_basename = seq_basename + "_" + datetime_str + "_" + slate_type
         movie_filename = movie_basename + "." + movie_ext
 
-        # Handle relative / absolute paths for movie location
-        # use globals config for movie location if none specified on the commandline
         if not self.movie_location:
             self.movie_location = self.globals_config["movie_location"]
             print(
@@ -219,23 +201,19 @@ class GenrateDaily:
             )
 
         if self.movie_location.startswith("/"):
-            # Absolute path specified
             self.movie_fullpath = os.path.join(self.movie_location, movie_filename)
         elif self.movie_location.startswith("~"):
-            # Path referencing home folder specified
             self.movie_location = os.path.expanduser(self.movie_location)
             self.movie_fullpath = os.path.join(self.movie_location, movie_filename)
         elif self.movie_location.startswith(".") or self.movie_location.startswith(
             ".."
         ):
-            # Relative path specified - will output relative to image sequence directory
             self.movie_fullpath = os.path.join(
                 self.image_sequence.dirname, self.movie_location, movie_filename
             )
         else:
             self.movie_fullpath = os.path.join(self.movie_location, movie_filename)
 
-        # Check output dir exists
         if not os.path.exists(os.path.dirname(self.movie_fullpath)):
             try:
                 os.makedirs(os.path.dirname(self.movie_fullpath))
@@ -247,7 +225,6 @@ class GenrateDaily:
                 )
                 return
 
-        # Set up Logger
         log_fullpath = os.path.splitext(self.movie_fullpath)[0] + ".log"
         if os.path.exists(log_fullpath):
             os.remove(log_fullpath)
@@ -274,13 +251,11 @@ class GenrateDaily:
             )
         )
 
-        # Set pixel_data_type based on config bitdepth
         if self.codec_config["bitdepth"] > 8:
             self.pixel_data_type = oiio.UINT16
         else:
             self.pixel_data_type = oiio.UINT8
 
-        # Get timecode based on frame
         tc = Timecode(self.globals_config["framerate"], start_timecode="00:00:00:00")
         self.start_tc = tc + self.image_sequence.start()
 
@@ -288,7 +263,6 @@ class GenrateDaily:
 
         log.info("ffmpeg command:\n\t{0}".format(ffmpeg_args))
 
-        # Static image buffer for text that doesn't change frame to frame
         self.static_text_buf_zero_frame = oiio.ImageBuf(
             oiio.ImageSpec(
                 self.output_width, self.output_height, 4, self.pixel_data_type
@@ -302,33 +276,48 @@ class GenrateDaily:
         )
 
         self.zero_frame = self.slate_profile.get("zero_frame")
-
-        # Loop through each text element, create the text image, and add it to self.static_text_buf_zero_frame
-        zero_frame_text_elements = self.zero_frame.get("static_text_elements")
+        zero_frame_text_elements = self.zero_frame.get("text_elements")
+        zero_frame_extra_elements = self.zero_frame.get("extras")
         if zero_frame_text_elements:
+
+            images = self.zero_frame.get("images")
+            for image_name, image_prop in images.items():
+                log.info("Generate Zero Frame Image Elements")
+                self.static_text_buf_zero_frame = self.create_image(
+                    image_prop, self.static_text_buf_zero_frame
+                )
+
             for text_element_name, text_element in zero_frame_text_elements.items():
-                log.info("Generate Text")
+                log.info("Generate Zero Frame Static Text Elements")
+                self.generate_text(
+                    text_element_name, text_element, self.static_text_buf_zero_frame
+                )
+
+            for text_element_name, text_element in zero_frame_extra_elements.items():
+                log.info("Generate Zero Frame Extra Text Elements")
                 self.generate_text(
                     text_element_name, text_element, self.static_text_buf_zero_frame
                 )
 
         self.first_frame = self.slate_profile.get("first_frame")
-
-        first_frame_text_elements = self.first_frame.get("static_text_elements")
+        first_frame_text_elements = self.first_frame.get("text_elements")
+        first_frame_extra_elements = self.first_frame.get("extras")
         if first_frame_text_elements:
             for text_element_name, text_element in first_frame_text_elements.items():
-                log.info("Generate Text")
+                log.info("Generate First Frame Static Text Elements")
                 self.generate_text(
                     text_element_name, text_element, self.static_text_buf_first_frame
                 )
 
-        if not DEBUG:
-            # Invoke ffmpeg subprocess
-            ffproc = subprocess.Popen(
-                shlex.split(ffmpeg_args), stdin=subprocess.PIPE, stdout=subprocess.PIPE
-            )
+            for text_element_name, text_element in first_frame_extra_elements.items():
+                log.info("Generate First Frame Extra Text Elements")
+                self.generate_text(
+                    text_element_name, text_element, self.static_text_buf_first_frame
+                )
 
-        # Loop through every frame, passing the result to the ffmpeg subprocess
+        ffproc = subprocess.Popen(
+            shlex.split(ffmpeg_args), stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
 
         for i, self.frame in enumerate(self.image_sequence, 1):
 
@@ -337,67 +326,31 @@ class GenrateDaily:
                     self.frame.frame, i, self.image_sequence.length()
                 )
             )
-            # elapsed_time = datetime.timedelta(seconds = time.time() - start_time)
-            # log.info("Time Elapsed: \t{0}".format(elapsed_time))
             frame_start_time = time.time()
 
             if i == 1:
                 buf = self.process_frame(self.frame, zero_frame=True)
 
-                images = self.zero_frame.get("images")
-                for image_name, image_prop in images.items():
-                    buf = self.create_image(image_prop, buf)
-
-                # defaults_text_element = self.zero_frame.get("defaults")
-                # for (
-                #     text_element_name,
-                #     text_element,
-                # ) in defaults_text_element.items():
-                #     if text_element_name == "frame_and_slate":
-                #         text_element["value"] = (
-                #             f"{self.image_sequence.length()} Frames + 1 Slate"
-                #         )
-                #     self.generate_text(text_element_name, text_element, buf)
-
             else:
                 buf = self.process_frame(self.frame)
 
-                first_frame_dynamic_text_elements = self.first_frame.get(
-                    "dynamic_text_elements"
-                )
-                if first_frame_dynamic_text_elements:
-                    for (
-                        text_element_name,
-                        text_element,
-                    ) in first_frame_dynamic_text_elements.items():
-                        log.info("Generate Text")
-                        self.generate_text(text_element_name, text_element, buf)
-
                 images = self.first_frame.get("images")
                 for image_name, image_prop in images.items():
+                    log.info("Generate First Frame Image Elements")
                     buf = self.create_image(image_prop, buf)
 
-            if not DEBUG:
-                # If MJPEG: convert from raw byte data to jpeg before passing to ffmpeg for concatenation
-                pixels = buf.get_pixels(self.pixel_data_type)
-                if self.codec_config["name"] == "mjpeg":
-                    jpeg_img = Image.fromarray(pixels, mode="RGB")
-                    jpeg_img.save(ffproc.stdin, "JPEG", subsampling="4:4:4", quality=95)
-                else:
-                    ffproc.stdin.write(pixels)
+            pixels = buf.get_pixels(self.pixel_data_type)
+            if self.codec_config["name"] == "mjpeg":
+                jpeg_img = Image.fromarray(pixels, mode="RGB")
+                jpeg_img.save(ffproc.stdin, "JPEG", subsampling="4:4:4", quality=95)
             else:
-                buf.write(
-                    os.path.splitext(self.movie_fullpath)[0]
-                    + ".{0:05d}.jpg".format(self.frame.frame)
-                )
+                ffproc.stdin.write(pixels)
 
             frame_elapsed_time = datetime.timedelta(
                 seconds=time.time() - frame_start_time
             )
             log.info("Frame Processing Time: \t{0}".format(frame_elapsed_time))
 
-        if not DEBUG:
-            result, error = ffproc.communicate()
         elapsed_time = datetime.timedelta(seconds=time.time() - self.start_time)
         log.info("Total Processing Time: \t{0}".format(elapsed_time))
         if self.renamed_file != "":
@@ -430,6 +383,7 @@ class GenrateDaily:
                     alpha = pillow_fg_image.split()[3]
                     alpha = ImageEnhance.Brightness(alpha).enhance(opacity)
                     pillow_fg_image.putalpha(alpha)
+
                 pillow_buf_image.alpha_composite(pillow_fg_image, (x_offset, y_offset))
                 composited_image_np = np.array(pillow_buf_image)
                 composited_image_buf = oiio.ImageBuf(composited_image_np)
@@ -459,14 +413,12 @@ class GenrateDaily:
         # Text Elements
         log.debug("Processing text element: {0}".format(text_element_name))
 
-        # Inherit globals if an element in text_element is not defined
         font = text_element["font"]
         if not os.path.isfile(font):
             log.error("Specified font does not exist! Using default font.")
             font_path = os.path.join(dir_path, "fonts", "Roboto", "Roboto-Regular.ttf")
             font = font_path
 
-        # Calculate font size and position
         font_size = text_element["font_size"]
         font_color = text_element["font_color"]
         box = text_element["box"]
@@ -479,41 +431,36 @@ class GenrateDaily:
         if justify != "left" or justify != "center":
             justify = "left"
 
-        # Scale back to pixels from %
         box_ll = [int(box[0] * self.output_width), int(box[1] * self.output_height)]
         box_ur = [int(box[2] * self.output_width), int(box[3] * self.output_height)]
         font_size = int(font_size * self.output_width)
 
-        # Get text to display
-        if text_element_name == "framecounter":
+        if text_element_name == "frame_count":
             if self.frame.frame == 0:
                 text_contents = ""
             else:
                 text_contents = str(self.frame.frame).zfill(4)
         else:
-            text_contents = " ".join(
-                [text_element["prefix"].strip(), text_element["value"]]
-            ).strip()
+            if text_element["islabel"]:
+                text_contents = text_element["value"]
+            else:
+                text_contents = self.datalist[f"{text_element_name}"]
 
-        # Convert from Nuke-style (reference = lower left) to OIIO Style (reference = upper left)
+        text_contents = textwrap.fill(text_contents, width=40)
+
         box_ll[1] = int(self.output_height - box_ll[1])
         box_ur[1] = int(self.output_height - box_ur[1])
 
-        # Calculate the width of the text
         text_roi = oiio.ImageBufAlgo.text_size(
             text_contents, fontsize=font_size, fontname=font
         )
 
-        # Calculate the new upper right x-coordinate based on the text width
         box_ur[0] = box_ll[0] + text_roi.width
 
-        # Adjust the box width to fit the text
         box_width = box_ur[0] - box_ll[0]
 
-        # Update the box_ur coordinate
         box_ur[0] = box_ll[0] + box_width
 
-        # Add text height to position
         box_ll[1] = int(box_ll[1] + text_roi.height)
         box_width = box_ur[0] - box_ll[0]
 
@@ -526,9 +473,9 @@ class GenrateDaily:
                     fontsize=font_size,
                     fontname=font,
                     textcolor=(
-                        font_color[0],
-                        font_color[1],
-                        font_color[2],
+                        font_color[0] / 255.0,
+                        font_color[1] / 255.0,
+                        font_color[2] / 255.0,
                         font_color[3],
                     ),
                     shadow=0,
@@ -543,9 +490,9 @@ class GenrateDaily:
                 fontsize=font_size,
                 fontname=font,
                 textcolor=(
-                    font_color[0],
-                    font_color[1],
-                    font_color[2],
+                    font_color[0] / 255.0,
+                    font_color[1] / 255.0,
+                    font_color[2] / 255.0,
                     font_color[3],
                 ),
                 alignx=justify,
@@ -574,11 +521,9 @@ class GenrateDaily:
             Returns an oiio.ImageBuf object which holds the altered image data.
         """
 
-        # Setup image buffer
         buf = oiio.ImageBuf(frame.path)
         spec = buf.spec()
 
-        # Get Codec Config and gather information
         iwidth = spec.width
         iheight = spec.height
         if float(iheight) != 0:
@@ -594,26 +539,20 @@ class GenrateDaily:
         cropwidth = self.globals_config.get("cropwidth")
         cropheight = self.globals_config.get("cropheight")
 
-        # Remove alpha channel
         oiio.ImageBufAlgo.channels(buf, buf, (0, 1, 2))
 
-        # Apply ocio color transform
         buf = self.apply_ocio_transform(buf)
 
-        # Setup for width and height
         if not self.output_width:
             resize = False
         else:
             resize = True
-            # If no output height specified, resize keeping aspect ratio, long side = width - calc height
             oheight_noar = int(self.output_width / iar)
             if not self.output_height:
                 self.output_height = oheight_noar
             oar = float(self.output_width) / float(self.output_height)
 
-        # Apply cropwidth / cropheight to remove pixels on edges before applying resize
         if cropwidth or cropheight:
-            # Handle percentages
             if type(cropwidth) == str:
                 if "%" in cropwidth:
                     cropwidth = int(float(cropwidth.split("%")[0]) / 100 * iwidth)
@@ -637,7 +576,6 @@ class GenrateDaily:
                 ),
             )
 
-            # Remove data window of buffer so resize works from cropped region
             buf.set_full(
                 buf.roi.xbegin,
                 buf.roi.xend,
@@ -649,7 +587,6 @@ class GenrateDaily:
 
             log.debug("CROPPED:{0} {1}".format(buf.spec().width, buf.spec().height))
 
-            # Recalculate input resolution and aspect ratio - since it may have changed with crop
             iwidth = buf.spec().width
             iheight = buf.spec().height
             iar = float(iwidth) / float(iheight)
@@ -658,13 +595,6 @@ class GenrateDaily:
             log.debug(
                 "iwidth:{0} x iheight:{1} x iar: {2}".format(iwidth, iheight, iar)
             )
-
-        # Apply Resize / Fit
-        # If input and output resolution are the same, do nothing
-        # If output width is bigger or smaller than input width, first resize without changing input aspect ratio
-        # If "fit" is true,
-        # If output height is different than input height: transform by the output height - input height / 2 to center,
-        # then crop to change the roi to the output res (crop moves upper left corner)
 
         identical = self.output_width == iwidth and self.output_height == iheight
         resize = not identical and resize
@@ -677,15 +607,12 @@ class GenrateDaily:
             )
 
             if iwidth != self.output_width:
-                # Perform resize, no change in AR
                 log.debug(
                     "iwidth does not equal output_width: oheight noar: {0}, pxfilter: {1}".format(
                         oheight_noar, px_filter
                     )
                 )
 
-                #############
-                #
                 if px_filter:
                     # (bug): using "lanczos3", 6.0, and upscaling causes artifacts
                     # (bug): dst buf must be assigned or ImageBufAlgo.resize doesn't work
@@ -700,7 +627,6 @@ class GenrateDaily:
                     )
 
             if fit:
-                # If fitting is enabled..
                 height_diff = self.output_height - oheight_noar
                 log.debug(
                     "Height difference: {0} {1} {2}".format(
@@ -708,16 +634,12 @@ class GenrateDaily:
                     )
                 )
 
-                # If we are cropping to a smaller height we need to transform first then crop
-                # If we pad to a taller height, we need to crop first, then transform.
                 if self.output_height < oheight_noar:
-                    # If we are cropping...
                     buf = self.oiio_transform(buf, 0, height_diff / 2)
                     buf = oiio.ImageBufAlgo.crop(
                         buf, roi=oiio.ROI(0, self.output_width, 0, self.output_height)
                     )
                 elif self.output_height > oheight_noar:
-                    # If we are padding...
                     buf = oiio.ImageBufAlgo.crop(
                         buf, roi=oiio.ROI(0, self.output_width, 0, self.output_height)
                     )
@@ -793,7 +715,6 @@ class GenrateDaily:
             A string containing the entire ffmpeg command to run.
         """
 
-        # ffmpeg-10bit No longer necessary in ffmpeg > 4.1
         ffmpeg_command = "ffmpeg"
 
         if self.codec_config["bitdepth"] >= 10:
@@ -802,12 +723,10 @@ class GenrateDaily:
             pixel_format = "rgb24"
 
         if self.codec_config["name"] == "mjpeg":
-            # Set up input arguments for frame input through pipe:
             args = "{0} -y -framerate {1} -i pipe:0".format(
                 ffmpeg_command, self.globals_config["framerate"]
             )
         else:
-            # Set up input arguments for raw video and pipe:
             args = "{0} -hide_banner -loglevel info -y -f rawvideo -pixel_format {1} -video_size {2}x{3} -framerate {4} -i pipe:0".format(
                 ffmpeg_command,
                 pixel_format,
@@ -816,7 +735,6 @@ class GenrateDaily:
                 self.globals_config["framerate"],
             )
 
-        # Add timecode so that start frame will display correctly in RV etc
         args += " -timecode {0}".format(self.start_tc)
 
         if self.codec_config["codec"]:
@@ -861,7 +779,6 @@ class GenrateDaily:
         if self.codec_config["bitrate"]:
             args += " -b:v {0}".format(self.codec_config["bitrate"])
 
-        # Finally add the output movie file path
         args += " {0}".format(self.movie_fullpath.replace("\\", "/"))
 
         return args
@@ -892,11 +809,9 @@ class GenrateDaily:
         ]
         print("Processing INPUT PATH: {0}".format(input_path))
         if os.path.isdir(input_path):
-            # Find image sequences recursively inside specified directory
             self.create_temp_frame(input_path)
             image_sequences = []
             for root, directories, filenames in os.walk(input_path):
-                # If there is more than 1 image file in input_path, search this path for file sequences also
                 if root == input_path:
                     image_files = [
                         f
@@ -917,8 +832,6 @@ class GenrateDaily:
                 )
                 return None
         elif os.path.isfile(input_path):
-            # Assume it's the first frame of the image sequence
-            # Try to split off the frame number to get a glob
             image = pyseq.get_sequences(input_path)
             if image:
                 image = image[0]
@@ -927,7 +840,6 @@ class GenrateDaily:
             )
 
         else:
-            # Assume this is a %05d or ### image sequence. Use the parent directory if it exists.
             dirname, filename = os.path.split(input_path)
             if os.path.isdir(dirname):
                 image_sequences = pyseq.get_sequences(dirname)
@@ -935,7 +847,6 @@ class GenrateDaily:
                 image_sequences = None
 
         if image_sequences:
-            # Remove image sequences not in list of approved extensions
             if not input_image_formats:
                 input_image_formats = ["exr"]
             actual_image_sequences = []
@@ -943,7 +854,7 @@ class GenrateDaily:
                 extension = image_sequence.name.split(".")[-1]
                 if extension in input_image_formats:
                     actual_image_sequences.append(image_sequence)
-            print("Found image sequences: \n{0}".format(actual_image_sequences))
+            log.info("Found image sequences: \n{0}".format(actual_image_sequences))
             return actual_image_sequences
         else:
             log.error("Could not find any Image Sequences!!!")
@@ -961,7 +872,7 @@ class GenrateDaily:
 
         f = os.listdir(input_path)
 
-        dir_path, base_filename = os.path.split(f[1])
+        folder_path, base_filename = os.path.split(f[1])
         base_filename_without_ext, ext = os.path.splitext(base_filename)
         zero_frame_filename = f"{base_filename_without_ext[:-4]}0000{ext}"
         first_frame_filename = f"{base_filename_without_ext[:-4]}0001{ext}"
@@ -971,7 +882,12 @@ class GenrateDaily:
 
 
 def main():
-    daily = GenrateDaily()
+    daily = GenrateDaily(
+        scope="Asset/env/CHAD_LAB_BUNKER_EXTERIOR",
+        project="bn2",
+        task_id=125880,
+        artist_notes="Minim sit id Lorem elit qui nostrud Lorem laborum.",
+    )
 
 
 if __name__ == "__main__":
